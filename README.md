@@ -1,252 +1,152 @@
-# Naksha Backend - Luxury Wardrobe REST API
+# Naksha API
 
-Modern, high-performance Python REST API backend built for **Naksha - Luxury Wardrobe** e-commerce application using **FastAPI**, **SQLAlchemy**, **Pydantic v2**, **Bcrypt**, and **JWT**.
+Django REST Framework backend for the existing Naksha React/Vite boutique storefront. It provides the bras and designer blouses catalog, anonymous guest sessions, persistent cart and wishlist data, and orders with server-calculated totals. The API does not change the storefront's design.
 
----
+The current frontend has no sign-in flow, so guest sessions own their carts, wishlists, and orders through an unguessable UUID sent in the `X-Guest-ID` header. No user accounts or JWT flow are added until the frontend has an authentication requirement. Online payment methods are recorded as **pending**; a payment gateway and its signed webhook must be integrated before online payments can be confirmed.
 
-## 🌟 Key Features
+## Requirements
 
-- **Robust Authentication & Security**:
-  - Secure password hashing with salt via **Bcrypt**.
-  - **JWT Tokens** (Access Token + Refresh Token flow) with cryptographic signature and unique `jti`.
-  - **6-digit Email OTP Verification** for user signup and secure password reset.
-  - Role-Based Access Control (**RBAC**) differentiating `customer` and `admin`.
-  - Google / Apple OAuth single sign-on endpoint.
-- **Product & Catalog Architecture**:
-  - Catalog categories matching the Naksha collection (*Bras*, *Panties*, *Sexy Lingerie*, *Baby Dolls*, *Nightwear*, *Shapewear*).
-  - Advanced search and filtering by Category, Tag (*Bestseller*, *40% Off*, *New*, *Trending*), Price range, and Sorting (*popular*, *price_asc*, *price_desc*, *newest*).
-  - Mood selector cards (*Everyday ease*, *Main character*, *Feel supported*).
-  - Promotional banners and trust highlights (*Free Shipping*, *Easy Returns*, etc.).
-- **Shopping Cart & Checkout**:
-  - Add to bag with quantities and sizes.
-  - Dynamic subtotal, free shipping threshold validation (₹999+), and grand total calculation.
-  - Order creation from cart or direct buy, order history, and cancellation.
-- **Wishlist**:
-  - Real-time product bookmarking and one-click toggle endpoint (`/api/v1/wishlist/toggle/{product_id}`).
-- **Admin Dashboard**:
-  - Store KPI metrics (total revenue, active orders, customer counts).
-  - Order status management (`PENDING`, `PROCESSING`, `SHIPPED`, `DELIVERED`, `CANCELLED`).
-  - Customer account management and moderation.
-- **Interactive API Documentation**:
-  - Automatically generated Swagger UI at `/docs` and ReDoc at `/redoc`.
+- Python 3.10+
+- PostgreSQL 14+ for local/production use
+- PowerShell on Windows
 
----
+SQLite is used only as a convenient fallback when no `DB_NAME` is configured, including automated tests. To use PostgreSQL, create the database and configure the environment first.
 
-## 🚀 Quickstart & Setup
+## Windows setup (PowerShell)
 
-### 1. Prerequisites
-- Python 3.10+ (tested on Python 3.13)
-- pip
+From the repository root:
 
-### 2. Install Dependencies
-```bash
-pip install -r requirements.txt
+```powershell
+py -3.10 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
 ```
 
-### 3. Environment Configuration
-Copy the template configuration:
-```bash
-cp .env.example .env
-```
-Default `.env` settings:
-```ini
-PROJECT_NAME="Naksha Luxury Wardrobe API"
-API_V1_STR="/api/v1"
-SECRET_KEY="naksha_super_secret_jwt_key_2026_change_in_production_secure_random_key_928174921"
-ALGORITHM="HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES=1440
-REFRESH_TOKEN_EXPIRE_DAYS=30
-DATABASE_URL="sqlite:///./naksha.db"
-BACKEND_CORS_ORIGINS=["http://localhost:5173","http://localhost:3000","http://127.0.0.1:5173","http://127.0.0.1:3000"]
-HOST=0.0.0.0
-PORT=8000
+Edit `.env` with a unique `SECRET_KEY`, PostgreSQL credentials, and allowed frontend origins. `.env` is ignored by Git.
+
+Create a local PostgreSQL role and database from `psql` as a PostgreSQL administrator:
+
+```sql
+CREATE USER naksha_user WITH PASSWORD 'choose-a-local-password';
+CREATE DATABASE naksha OWNER naksha_user;
 ```
 
-### 4. Initialize & Seed Database
-Run the seed script to create all database tables and populate catalog products, categories, moods, and default accounts:
-```bash
-python seed.py
+Set the `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`, and `DB_PORT` values in `.env` to match. Do not use the example password in a deployed environment.
+
+Create database tables, load the existing storefront catalog, and start Django:
+
+```powershell
+python manage.py migrate
+python manage.py seed_catalog
+python manage.py createsuperuser
+python manage.py runserver 127.0.0.1:8000
 ```
 
-### 5. Start the API Server
-```bash
-python run.py
-```
-Or via uvicorn directly:
-```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
+The API is available under `http://127.0.0.1:8000/api/v1/`; Django admin is at `/admin/`. The catalog seed is repeatable and updates the eight products and two categories represented in `src/data/productsData.js` and `src/data/categoriesData.js` in the frontend.
 
-Server endpoints:
-- **API Base**: `http://127.0.0.1:8000`
-- **Interactive Swagger UI**: `http://127.0.0.1:8000/docs`
-- **ReDoc UI**: `http://127.0.0.1:8000/redoc`
+Set `FRONTEND_ORIGINS` to a comma-separated list of exact trusted browser origins. The default permits Vite on `localhost:5173` and `127.0.0.1:5173`.
 
----
+## API
 
-## 🔑 Pre-Configured Test Accounts
+All responses are JSON. Product/category lists use limit-offset pagination: `?limit=24&offset=0`. Prices and totals are returned as JSON numbers in INR; the server always calculates cart/order prices from current database product prices, never from client-supplied amounts.
 
-| Role | Email | Password |
-|---|---|---|
-| **Admin** | `admin@naksha.com` | `Admin@Naksha2026` |
-| **Customer** | `demo@naksha.com` | `Naksha@2026` |
-
----
-
-## 📡 API Endpoints Reference
-
-All API routes are prefixed under `/api/v1`.
-
-### 1. Authentication (`/api/v1/auth`)
-
-| Method | Endpoint | Description | Auth Required |
+| Method | URL | Purpose | Guest session |
 |---|---|---|---|
-| `POST` | `/api/v1/auth/register` | Register new user & send 6-digit verification OTP | None |
-| `POST` | `/api/v1/auth/verify-otp` | Verify 6-digit OTP & activate account (returns JWT) | None |
-| `POST` | `/api/v1/auth/resend-otp` | Resend fresh 6-digit OTP code | None |
-| `POST` | `/api/v1/auth/login` | Login with email and password (returns access & refresh token) | None |
-| `POST` | `/api/v1/auth/refresh` | Obtain fresh access token using refresh token | None |
-| `POST` | `/api/v1/auth/forgot-password` | Request password reset 6-digit OTP | None |
-| `POST` | `/api/v1/auth/reset-password` | Verify reset OTP and update password | None |
-| `POST` | `/api/v1/auth/oauth` | Google / Apple single sign-on authentication | None |
-| `GET` | `/api/v1/auth/me` | Fetch logged-in user profile | Bearer Token |
-| `PUT` | `/api/v1/auth/me` | Update user profile (name, phone) | Bearer Token |
-| `PUT` | `/api/v1/auth/change-password` | Change account password | Bearer Token |
-| `POST` | `/api/v1/auth/logout` | Revoke refresh tokens and log out | Bearer Token |
+| `GET` | `/api/v1/categories/` | List active categories and their subcategories | No |
+| `GET` | `/api/v1/categories/{id}/` | Retrieve a category (`bra` or `blouse`) | No |
+| `GET` | `/api/v1/products/` | List/filter/search/sort products | No |
+| `GET` | `/api/v1/products/{slug}/` | Retrieve a product | No |
+| `POST` | `/api/v1/session/` | Create a guest session | No |
+| `GET` | `/api/v1/cart` | Read the guest cart and calculated totals | `X-Guest-ID` |
+| `POST` | `/api/v1/cart/items` | Add a product variant; combines identical variants | `X-Guest-ID` |
+| `PATCH` | `/api/v1/cart/items/{itemId}` | Set an item quantity | `X-Guest-ID` |
+| `DELETE` | `/api/v1/cart/items/{itemId}` | Remove one cart item | `X-Guest-ID` |
+| `DELETE` | `/api/v1/cart` | Clear the guest cart | `X-Guest-ID` |
+| `GET` | `/api/v1/wishlist` | Get saved products and product IDs | `X-Guest-ID` |
+| `POST` | `/api/v1/wishlist/toggle/{productId}` | Add/remove a saved product | `X-Guest-ID` |
+| `DELETE` | `/api/v1/wishlist` | Clear the guest wishlist | `X-Guest-ID` |
+| `POST` | `/api/v1/orders` | Create an order from cart or submitted item variants | `X-Guest-ID` |
+| `GET` | `/api/v1/orders` | List guest orders | `X-Guest-ID` |
+| `GET` | `/api/v1/orders/{orderId}` | Read one guest-owned order | `X-Guest-ID` |
+| `POST` | `/api/v1/orders/{orderId}/cancel` | Cancel a pending order | `X-Guest-ID` |
 
-### 2. Products Catalog (`/api/v1/products`)
+Product query parameters: `category` (or `cat`), `search` (or `q`), `size`, `cup`, `padding`, `wire`, and `sort_by`. Supported sort values are `featured`, `popular`, `price_asc`, `price_desc`, `rating`, and `newest`.
 
-| Method | Endpoint | Description | Auth Required |
-|---|---|---|---|
-| `GET` | `/api/v1/products` | Query products with category, search, tag, sorting & pagination | None |
-| `GET` | `/api/v1/products/{id}` | Get detailed product information | None |
-| `POST` | `/api/v1/products` | Create a new product | Admin |
-| `PUT` | `/api/v1/products/{id}` | Update product information | Admin |
-| `DELETE` | `/api/v1/products/{id}` | Delete a product from catalog | Admin |
+### Guest checkout example
 
-**Query Parameters for `GET /api/v1/products`**:
-- `category`: Category name (`Bras`, `Panties`, `Sexy Lingerie`, `Baby Dolls`, `Nightwear`, `Shapewear`, `Sale`, or `All`)
-- `search`: Search query string
-- `tag`: Filter by tag (`Bestseller`, `40% Off`, `New`, `Trending`)
-- `sort_by`: `popular` (default), `price_asc`, `price_desc`, `newest`
-- `min_price`, `max_price`: Price range filters
-- `limit`, `offset`: Pagination controls
+Create a guest session:
 
-### 3. Categories (`/api/v1/categories`)
-
-| Method | Endpoint | Description | Auth Required |
-|---|---|---|---|
-| `GET` | `/api/v1/categories` | List all active product categories | None |
-| `GET` | `/api/v1/categories/{id_or_slug}` | Retrieve category by numeric ID or slug (e.g. `bras`) | None |
-| `POST` | `/api/v1/categories` | Add a new category | Admin |
-| `PUT` | `/api/v1/categories/{id}` | Update category | Admin |
-| `DELETE` | `/api/v1/categories/{id}` | Delete category | Admin |
-
-### 4. Moods & Promotions (`/api/v1/moods`, `/api/v1/promotions`, `/api/v1/highlights`)
-
-| Method | Endpoint | Description | Auth Required |
-|---|---|---|---|
-| `GET` | `/api/v1/moods` | Get mood-based collections ("What are you feeling today?") | None |
-| `POST` | `/api/v1/moods` | Add a new mood card | Admin |
-| `GET` | `/api/v1/promotions` | List promotional sale edit cards | None |
-| `GET` | `/api/v1/highlights` | Get service guarantees (Free shipping, Easy returns, etc.) | None |
-
-### 5. Shopping Cart (`/api/v1/cart`)
-
-| Method | Endpoint | Description | Auth Required |
-|---|---|---|---|
-| `GET` | `/api/v1/cart` | Get current user's shopping bag & totals | Bearer Token |
-| `POST` | `/api/v1/cart/items` | Add product to bag with quantity and size | Bearer Token |
-| `PUT` | `/api/v1/cart/items/{item_id}`| Update cart item quantity or size | Bearer Token |
-| `DELETE`| `/api/v1/cart/items/{item_id}`| Remove item from bag | Bearer Token |
-| `DELETE`| `/api/v1/cart` | Clear entire bag | Bearer Token |
-
-### 6. Wishlist (`/api/v1/wishlist`)
-
-| Method | Endpoint | Description | Auth Required |
-|---|---|---|---|
-| `GET` | `/api/v1/wishlist` | Get wishlisted items and array of `product_ids` | Bearer Token |
-| `POST` | `/api/v1/wishlist/toggle/{product_id}` | 1-Click toggle (adds if absent, removes if present) | Bearer Token |
-| `POST` | `/api/v1/wishlist/{product_id}` | Add product to wishlist | Bearer Token |
-| `DELETE`| `/api/v1/wishlist/{product_id}` | Remove product from wishlist | Bearer Token |
-
-### 7. Orders & Checkout (`/api/v1/orders`)
-
-| Method | Endpoint | Description | Auth Required |
-|---|---|---|---|
-| `POST` | `/api/v1/orders` | Place order (from cart or direct items) with delivery address | Bearer Token |
-| `GET` | `/api/v1/orders` | List customer order history | Bearer Token |
-| `GET` | `/api/v1/orders/{id}` | View single order details | Bearer Token |
-| `POST` | `/api/v1/orders/{id}/cancel` | Cancel a pending order | Bearer Token |
-
-### 8. Newsletter & Contact (`/api/v1/newsletter`, `/api/v1/contact`)
-
-| Method | Endpoint | Description | Auth Required |
-|---|---|---|---|
-| `POST` | `/api/v1/newsletter/subscribe` | Subscribe email to Naksha newsletter | None |
-| `POST` | `/api/v1/contact` | Submit customer support inquiry | None |
-
-### 9. Admin Portal (`/api/v1/admin`)
-
-| Method | Endpoint | Description | Auth Required |
-|---|---|---|---|
-| `GET` | `/api/v1/admin/dashboard` | KPI analytics (revenue, total orders, users, products) | Admin |
-| `GET` | `/api/v1/admin/orders` | View all customer orders with status filter | Admin |
-| `PUT` | `/api/v1/admin/orders/{id}/status` | Update order processing/shipping status | Admin |
-| `GET` | `/api/v1/admin/users` | List all registered users | Admin |
-| `PUT` | `/api/v1/admin/users/{id}/status` | Activate or suspend user account | Admin |
-
----
-
-## 🧪 Running Automated Tests
-
-Run the full integration test suite:
-```bash
-python -m pytest tests/test_api.py -v
+```http
+POST /api/v1/session/
 ```
 
-All 8 tests cover authentication, OTP validation, catalog filters, cart calculations, wishlist toggle, checkout flow, admin management, and newsletter subscription.
-
----
-
-## 💻 Frontend Integration (React Example)
-
-In your `Naksha_FrontEnd` React application:
-
-```javascript
-// src/services/api.js
-const API_BASE = 'http://127.0.0.1:8000/api/v1';
-
-export const loginUser = async (email, password) => {
-  const response = await fetch(`${API_BASE}/auth/login`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email, password }),
-  });
-  const data = await response.json();
-  if (response.ok) {
-    localStorage.setItem('token', data.access_token);
-  }
-  return data;
-};
-
-export const fetchProducts = async (category = 'All', search = '') => {
-  const params = new URLSearchParams();
-  if (category && category !== 'All') params.append('category', category);
-  if (search) params.append('search', search);
-
-  const response = await fetch(`${API_BASE}/products?${params.toString()}`);
-  return response.json();
-};
-
-export const toggleWishlist = async (productId, token) => {
-  const response = await fetch(`${API_BASE}/wishlist/toggle/${productId}`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json'
-    }
-  });
-  return response.json();
-};
+```json
+{"guestId":"<uuid>"}
 ```
+
+Keep that UUID in the frontend and send it as `X-Guest-ID` on cart, wishlist, and order requests. Add a bra variant:
+
+```http
+POST /api/v1/cart/items
+X-Guest-ID: <uuid>
+Content-Type: application/json
+```
+
+```json
+{
+  "productId": "bra-01",
+  "selectedSize": "34",
+  "selectedCup": "C",
+  "selectedColor": "Nude Beige",
+  "quantity": 1
+}
+```
+
+Place an order using the current cart:
+
+```http
+POST /api/v1/orders
+X-Guest-ID: <uuid>
+Content-Type: application/json
+```
+
+```json
+{
+  "shippingAddress": {
+    "fullName": "Priya Sharma",
+    "phone": "9876543210",
+    "address": "Flat 402, Lotus Residency, MG Road",
+    "city": "Mumbai",
+    "state": "Maharashtra",
+    "pincode": "400001",
+    "discreetPackage": true
+  },
+  "paymentMethod": "upi"
+}
+```
+
+The order response contains the order reference, item snapshots, shipping address, server-calculated subtotal/shipping/total, order status, and `paymentStatus: "pending"`. Free shipping applies at ₹999; otherwise shipping is ₹99. The cart is cleared only after an order based on that cart is successfully created. A direct order may pass an `items` array with the same product/variant fields used by the cart endpoint.
+
+Invalid product variants and shipping data return `400`; requests without a valid guest ID return `400`; accessing another guest's order/item returns `404`; cancelling a non-pending order returns `409`. Prices and totals in incoming requests are ignored.
+
+## Tests
+
+Tests use Django's test database and never target the configured development database:
+
+```powershell
+python manage.py test apps.catalog apps.commerce
+python manage.py check
+```
+
+## Postman
+
+Set a Postman environment variable `baseUrl` to `http://127.0.0.1:8000` and `guestId` to the UUID returned by `POST {{baseUrl}}/api/v1/session/`. For cart, wishlist, and order requests, add the `X-Guest-ID: {{guestId}}` header. Start with the session and product list requests above; then exercise add/read/update/delete cart, wishlist toggle, order create/read/cancel, and invalid-size/pincode requests.
+
+## Current scope
+
+- Public product/category reads and guest-owned cart, wishlist, and order endpoints are implemented.
+- The existing bra-size calculator is client-side math, so it does not need a backend endpoint.
+- No login/auth UI, newsletter form, contact form, or payment gateway exists in the inspected frontend. Those flows are not fabricated here.
+- Admin users can manage catalog entries and inspect/update orders through Django admin.
