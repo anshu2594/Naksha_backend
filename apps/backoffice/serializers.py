@@ -6,6 +6,7 @@ from django.utils.timezone import is_aware
 from django.utils.text import slugify
 
 from rest_framework import serializers
+from drf_spectacular.utils import extend_schema_field, inline_serializer
 
 from apps.catalog.models import (
     Category,
@@ -13,7 +14,7 @@ from apps.catalog.models import (
     ProductImage,
 )
 from apps.catalog.validators import validate_product_image
-from apps.commerce.models import DiscountOffer, Order, PaymentRefund
+from apps.commerce.models import DiscountOffer, Order, PaymentRefund, RazorpayPayment
 from apps.commerce.serializers import OrderSerializer
 
 
@@ -72,6 +73,8 @@ class ProductAdminSerializer(serializers.ModelSerializer):
     )
     isActive = serializers.BooleanField(source="is_active", required=False)
     sortOrder = serializers.IntegerField(source="sort_order", required=False)
+    createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+    updatedAt = serializers.DateTimeField(source="updated_at", read_only=True)
     availableSizes = serializers.ListField(
         source="available_sizes", child=serializers.CharField(), required=False
     )
@@ -122,6 +125,8 @@ class ProductAdminSerializer(serializers.ModelSerializer):
             "features",
             "isActive",
             "sortOrder",
+            "createdAt",
+            "updatedAt",
         ]
 
     def create(self, validated_data):
@@ -153,7 +158,7 @@ class ProductImageSerializer(serializers.ModelSerializer):
         fields = ["id", "url", "altText", "sortOrder", "createdAt"]
         read_only_fields = ["id", "url", "createdAt"]
 
-    def get_url(self, instance):
+    def get_url(self, instance) -> str:
         request = self.context.get("request")
         return request.build_absolute_uri(instance.image.url) if request else instance.image.url
 
@@ -217,6 +222,7 @@ class DiscountOfferSerializer(serializers.ModelSerializer):
     isActive = serializers.BooleanField(source="is_active", required=False)
     createdAt = serializers.DateTimeField(source="created_at", read_only=True)
     updatedAt = serializers.DateTimeField(source="updated_at", read_only=True)
+    status = serializers.SerializerMethodField()
 
     class Meta:
         model = DiscountOffer
@@ -234,6 +240,7 @@ class DiscountOfferSerializer(serializers.ModelSerializer):
             "usageLimit",
             "usageCount",
             "isActive",
+            "status",
             "createdAt",
             "updatedAt",
         ]
@@ -244,6 +251,23 @@ class DiscountOfferSerializer(serializers.ModelSerializer):
         if not value or any(character.isspace() for character in value):
             raise serializers.ValidationError("Use a coupon code without spaces.")
         return value
+
+    def get_status(self, instance) -> str:
+        from django.utils import timezone
+
+        if not instance.is_active:
+            return "inactive"
+        if (
+            instance.usage_limit is not None
+            and instance.usage_count >= instance.usage_limit
+        ):
+            return "exhausted"
+        now = timezone.now()
+        if now < instance.starts_at:
+            return "scheduled"
+        if now >= instance.ends_at:
+            return "expired"
+        return "active"
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
@@ -296,6 +320,20 @@ class OrderDetailAdminSerializer(AdminOrderSerializer):
     class Meta(AdminOrderSerializer.Meta):
         fields = AdminOrderSerializer.Meta.fields + ["statusHistory"]
 
+    @extend_schema_field(
+        serializers.ListField(
+            child=inline_serializer(
+                name="OrderStatusHistoryEntry",
+                fields={
+                    "from": serializers.CharField(allow_null=True),
+                    "to": serializers.CharField(),
+                    "note": serializers.CharField(allow_blank=True),
+                    "changedBy": serializers.CharField(allow_null=True),
+                    "createdAt": serializers.DateTimeField(),
+                },
+            )
+        )
+    )
     def get_statusHistory(self, instance):
         return [
             {
@@ -318,3 +356,36 @@ class PaymentRefundSerializer(serializers.ModelSerializer):
         model = PaymentRefund
         fields = ["id", "amount", "status", "razorpayRefundId", "createdAt"]
         read_only_fields = fields
+
+
+class AdminPaymentSerializer(serializers.ModelSerializer):
+    orderId = serializers.CharField(source="order.order_number", read_only=True)
+    gatewayOrderId = serializers.CharField(
+        source="gateway_order_id", allow_null=True, read_only=True
+    )
+    gatewayPaymentId = serializers.CharField(
+        source="gateway_payment_id", allow_null=True, read_only=True
+    )
+    createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+    updatedAt = serializers.DateTimeField(source="updated_at", read_only=True)
+    refunds = serializers.SerializerMethodField()
+
+    class Meta:
+        model = RazorpayPayment
+        fields = [
+            "id",
+            "orderId",
+            "gatewayOrderId",
+            "gatewayPaymentId",
+            "amount",
+            "currency",
+            "status",
+            "createdAt",
+            "updatedAt",
+            "refunds",
+        ]
+
+    @extend_schema_field(PaymentRefundSerializer(many=True))
+    def get_refunds(self, instance):
+        refunds = instance.order.refunds.all()
+        return PaymentRefundSerializer(refunds, many=True).data

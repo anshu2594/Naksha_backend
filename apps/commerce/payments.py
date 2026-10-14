@@ -13,11 +13,17 @@ from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
-from rest_framework import status
+from rest_framework import serializers, status
 from rest_framework.exceptions import APIException, ValidationError
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import (
+    OpenApiParameter,
+    extend_schema,
+    inline_serializer,
+)
 
 from .inventory import release_order_inventory, reserve_order_inventory
 from .models import (
@@ -32,6 +38,18 @@ from .views import Conflict, get_guest
 
 logger = logging.getLogger(__name__)
 RAZORPAY_API = "https://api.razorpay.com/v1"
+GUEST_ID_PARAMETER = OpenApiParameter(
+    name="X-Guest-ID",
+    type=OpenApiTypes.UUID,
+    location=OpenApiParameter.HEADER,
+    required=True,
+)
+IDEMPOTENCY_PARAMETER = OpenApiParameter(
+    name="Idempotency-Key",
+    type=OpenApiTypes.STR,
+    location=OpenApiParameter.HEADER,
+    required=True,
+)
 
 
 class PaymentGatewayError(APIException):
@@ -155,6 +173,21 @@ class RazorpayCheckoutView(APIView):
     permission_classes = []
     authentication_classes = []
 
+    @extend_schema(
+        request=None,
+        parameters=[GUEST_ID_PARAMETER, IDEMPOTENCY_PARAMETER],
+        responses=inline_serializer(
+            name="RazorpayCheckout",
+            fields={
+                "keyId": serializers.CharField(),
+                "razorpayOrderId": serializers.CharField(),
+                "amount": serializers.IntegerField(),
+                "currency": serializers.CharField(),
+                "orderId": serializers.CharField(),
+            },
+        ),
+        operation_id="razorpay_checkout_create",
+    )
     def post(self, request, order_number):
         guest = get_guest(request)
         idempotency_key = request.headers.get("Idempotency-Key", "").strip()
@@ -242,6 +275,19 @@ class RazorpayVerifyView(APIView):
     permission_classes = []
     authentication_classes = []
 
+    @extend_schema(
+        parameters=[GUEST_ID_PARAMETER],
+        request=inline_serializer(
+            name="RazorpayPaymentVerification",
+            fields={
+                "razorpay_order_id": serializers.CharField(),
+                "razorpay_payment_id": serializers.CharField(),
+                "razorpay_signature": serializers.CharField(),
+            },
+        ),
+        responses=OrderSerializer,
+        operation_id="razorpay_payment_verify",
+    )
     def post(self, request, order_number):
         guest = get_guest(request)
         gateway_order_id = request.data.get("razorpay_order_id", "")
@@ -434,6 +480,28 @@ class RazorpayWebhookView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
 
+    @extend_schema(
+        request=OpenApiTypes.OBJECT,
+        parameters=[
+            OpenApiParameter(
+                name="X-Razorpay-Signature",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.HEADER,
+                required=True,
+            ),
+            OpenApiParameter(
+                name="X-Razorpay-Event-Id",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.HEADER,
+                required=True,
+            ),
+        ],
+        responses=inline_serializer(
+            name="RazorpayWebhookResult",
+            fields={"status": serializers.CharField()},
+        ),
+        operation_id="razorpay_webhook_receive",
+    )
     def post(self, request):
         secret = getattr(settings, "RAZORPAY_WEBHOOK_SECRET", "")
         signature = request.headers.get("X-Razorpay-Signature", "")

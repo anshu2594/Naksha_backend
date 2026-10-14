@@ -21,7 +21,9 @@ if not DEBUG and SECRET_KEY == "local-development-only-change-before-deployment"
     raise ImproperlyConfigured("Set a private SECRET_KEY when DEBUG is disabled.")
 ALLOWED_HOSTS = [
     host.strip()
-    for host in os.getenv("ALLOWED_HOSTS", "127.0.0.1,localhost").split(",")
+    for host in os.getenv(
+        "ALLOWED_HOSTS", "127.0.0.1,localhost" if DEBUG else ""
+    ).split(",")
     if host.strip()
 ]
 
@@ -34,6 +36,7 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "corsheaders",
     "rest_framework",
+    "drf_spectacular",
     "rest_framework_simplejwt.token_blacklist",
     "apps.catalog",
     "apps.commerce",
@@ -117,6 +120,44 @@ REST_FRAMEWORK = {
         "user": "1200/hour",
         "auth_login": "10/hour",
         "auth_refresh": "30/hour",
+        "auth_register": "5/hour",
+    },
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+}
+SPECTACULAR_SETTINGS = {
+    "TITLE": "Naksha API",
+    "DESCRIPTION": (
+        "Public catalog, guest checkout, customer authentication, staff "
+        "management, and Razorpay sandbox API."
+    ),
+    "VERSION": "1.0.0",
+    "SERVE_INCLUDE_SCHEMA": False,
+    "PREPROCESSING_HOOKS": ["config.schema.document_canonical_routes"],
+    "ENUM_NAME_OVERRIDES": {
+        "OrderStatus": [
+            ("PENDING", "Pending"),
+            ("PROCESSING", "Processing"),
+            ("SHIPPED", "Shipped"),
+            ("DELIVERED", "Delivered"),
+            ("CANCELLED", "Cancelled"),
+        ],
+        "OrderPaymentStatus": [
+            ("pending", "Pending"),
+            ("paid", "Paid"),
+            ("failed", "Failed"),
+            ("partially_refunded", "Partially refunded"),
+            ("refunded", "Refunded"),
+        ],
+        "RazorpayPaymentStatus": [
+            ("created", "Created"),
+            ("captured", "Captured"),
+            ("failed", "Failed"),
+        ],
+        "RefundStatus": [
+            ("pending", "Pending"),
+            ("processed", "Processed"),
+            ("failed", "Failed"),
+        ],
     },
 }
 SIMPLE_JWT = {
@@ -156,6 +197,26 @@ MEDIA_ROOT = Path(os.getenv("MEDIA_ROOT", BASE_DIR / "media"))
 SESSION_COOKIE_SECURE = not DEBUG
 CSRF_COOKIE_SECURE = not DEBUG
 CSRF_COOKIE_HTTPONLY = False
+SESSION_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_SAMESITE = "Lax"
+SECURE_SSL_REDIRECT = env_bool("SECURE_SSL_REDIRECT", not DEBUG)
+SECURE_HSTS_SECONDS = int(
+    os.getenv("SECURE_HSTS_SECONDS", "0" if DEBUG else "31536000")
+)
+SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool(
+    "SECURE_HSTS_INCLUDE_SUBDOMAINS", not DEBUG
+)
+SECURE_HSTS_PRELOAD = env_bool("SECURE_HSTS_PRELOAD", False)
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = "same-origin"
+X_FRAME_OPTIONS = "DENY"
+if os.getenv("SECURE_PROXY_SSL_HEADER"):
+    proxy_header = os.environ["SECURE_PROXY_SSL_HEADER"].split(",", maxsplit=1)
+    if len(proxy_header) != 2:
+        raise ImproperlyConfigured(
+            "SECURE_PROXY_SSL_HEADER must contain the header and value separated by a comma."
+        )
+    SECURE_PROXY_SSL_HEADER = (proxy_header[0].strip(), proxy_header[1].strip())
 
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")

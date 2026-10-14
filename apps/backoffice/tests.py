@@ -20,6 +20,7 @@ from apps.commerce.models import (
     DiscountOffer,
     GuestSession,
     Order,
+    OrderItem,
     OrderStatusHistory,
     PaymentRefund,
     RazorpayPayment,
@@ -80,7 +81,7 @@ class BackofficeApiTests(APITestCase):
 
         self.authenticate(login.data["access"])
         profile = self.client.get("/api/v1/auth/me/")
-        self.assertEqual(profile.status_code, 200)
+        self.assertEqual(profile.status_code, 200, profile.data)
         self.assertEqual(
             profile.data,
             {
@@ -103,6 +104,309 @@ class BackofficeApiTests(APITestCase):
 
         self.authenticate()
         self.assertEqual(self.client.get("/api/v1/admin/products/").status_code, 401)
+
+    def test_customer_registration_profile_and_admin_account_controls(self):
+        response = self.client.post(
+            "/api/v1/auth/register/",
+            {
+                "username": "new-customer",
+                "email": "customer@example.com",
+                "password": "Safe-Customer-Password-145!",
+                "confirmPassword": "Safe-Customer-Password-145!",
+                "firstName": "Anya",
+                "lastName": "Shah",
+                "phone": "+91 9876543210",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["role"], "customer")
+        self.assertFalse(response.data["isStaff"])
+        self.assertNotIn("password", response.data)
+
+        login = self.client.post(
+            "/api/v1/auth/login/",
+            {
+                "username": "new-customer",
+                "password": "Safe-Customer-Password-145!",
+            },
+            format="json",
+        )
+        self.assertEqual(login.status_code, 200, login.data)
+        self.assertEqual(set(login.data), {"refresh", "access"})
+        self.authenticate(self.staff_token)
+        self.assertEqual(self.client.get("/api/v1/auth/profile/").status_code, 403)
+
+        duplicate_email = self.client.post(
+            "/api/v1/auth/register/",
+            {
+                "username": "another-customer",
+                "email": "CUSTOMER@example.com",
+                "password": "Safe-Customer-Password-145!",
+                "confirmPassword": "Safe-Customer-Password-145!",
+            },
+            format="json",
+        )
+        self.assertEqual(duplicate_email.status_code, 400)
+        duplicate_username = self.client.post(
+            "/api/v1/auth/register/",
+            {
+                "username": "new-customer",
+                "email": "different@example.com",
+                "password": "Safe-Customer-Password-145!",
+                "confirmPassword": "Safe-Customer-Password-145!",
+            },
+            format="json",
+        )
+        self.assertEqual(duplicate_username.status_code, 400)
+        invalid_password = self.client.post(
+            "/api/v1/auth/register/",
+            {
+                "username": "weak-password-customer",
+                "email": "weak@example.com",
+                "password": "password",
+                "confirmPassword": "password",
+            },
+            format="json",
+        )
+        self.assertEqual(invalid_password.status_code, 400)
+        mismatch = self.client.post(
+            "/api/v1/auth/register/",
+            {
+                "username": "mismatch-customer",
+                "email": "mismatch@example.com",
+                "password": "Safe-Customer-Password-145!",
+                "confirmPassword": "Different-Password-145!",
+            },
+            format="json",
+        )
+        self.assertEqual(mismatch.status_code, 400)
+
+        self.authenticate(login.data["access"])
+        profile = self.client.get("/api/v1/auth/profile/")
+        self.assertEqual(profile.status_code, 200, profile.data)
+        self.assertEqual(profile.data["phone"], "+91 9876543210")
+        changed = self.client.patch(
+            "/api/v1/auth/profile/",
+            {
+                "firstName": "Ananya",
+                "phone": "+91 9999999999",
+                "email": "ananya@example.com",
+            },
+            format="json",
+        )
+        self.assertEqual(changed.status_code, 200, changed.data)
+        self.assertEqual(changed.data["firstName"], "Ananya")
+        self.assertEqual(changed.data["email"], "ananya@example.com")
+        legacy_me = self.client.get("/api/v1/auth/me/")
+        self.assertEqual(
+            set(legacy_me.data),
+            {"id", "username", "email", "role", "isStaff"},
+        )
+        self.assertFalse(legacy_me.data["isStaff"])
+        self.assertEqual(self.client.get("/api/v1/admin/customers/").status_code, 403)
+
+        self.authenticate(self.staff_token)
+        accounts = self.client.get(
+            "/api/v1/admin/customers/accounts/?search=ananya&limit=10"
+        )
+        self.assertEqual(accounts.status_code, 200, accounts.data)
+        self.assertEqual(accounts.data["count"], 1)
+        customer_id = accounts.data["results"][0]["id"]
+        detail_url = f"/api/v1/admin/customers/accounts/{customer_id}/"
+        detail = self.client.patch(
+            detail_url,
+            {"isActive": False, "phone": "+91 8888888888"},
+            format="json",
+        )
+        self.assertEqual(detail.status_code, 200, detail.data)
+        self.assertFalse(detail.data["isActive"])
+        self.assertEqual(detail.data["phone"], "+91 8888888888")
+        self.assertEqual(
+            self.client.patch(detail_url, {"password": "new-value"}, format="json").status_code,
+            400,
+        )
+
+        self.client.credentials()
+        inactive_access = self.client.get(
+            "/api/v1/auth/profile/",
+            HTTP_AUTHORIZATION=f"Bearer {login.data['access']}",
+        )
+        self.assertEqual(inactive_access.status_code, 401)
+
+    def test_dashboard_exposes_management_metrics_and_summaries(self):
+        order = self.create_order()
+        order.status = Order.Status.PROCESSING
+        order.save(update_fields=["status"])
+        OrderItem.objects.create(
+            order=order,
+            product=Product.objects.get(pk="bra-01"),
+            product_id_snapshot="bra-01",
+            name="Test bra",
+            slug="test-bra",
+            image="https://example.com/test.jpg",
+            unit_price=Decimal("899.00"),
+            selected_size="34",
+            selected_cup="C",
+            quantity=2,
+        )
+        now = timezone.now()
+        DiscountOffer.objects.create(
+            code="ACTIVE",
+            name="Active",
+            discount_type=DiscountOffer.DiscountType.FIXED,
+            discount_value=Decimal("10"),
+            starts_at=now - timedelta(minutes=1),
+            ends_at=now + timedelta(minutes=1),
+        )
+        DiscountOffer.objects.create(
+            code="SCHEDULED",
+            name="Scheduled",
+            discount_type=DiscountOffer.DiscountType.FIXED,
+            discount_value=Decimal("10"),
+            starts_at=now + timedelta(days=1),
+            ends_at=now + timedelta(days=2),
+        )
+        self.authenticate(self.staff_token)
+        dashboard = self.client.get("/api/v1/admin/dashboard/")
+        self.assertEqual(dashboard.status_code, 200)
+        for key in (
+            "totalProducts",
+            "totalCustomers",
+            "totalOrders",
+            "totalSales",
+            "successfulPayments",
+            "pendingPayments",
+            "failedPayments",
+            "activeOffers",
+            "scheduledOffers",
+            "recentOrders",
+            "bestSellingProducts",
+        ):
+            self.assertIn(key, dashboard.data)
+        self.assertEqual(dashboard.data["totalOrders"], 1)
+        self.assertEqual(dashboard.data["activeOffers"], 1)
+        self.assertEqual(dashboard.data["scheduledOffers"], 1)
+        self.assertEqual(
+            dashboard.data["bestSellingProducts"][0]["unitsSold"],
+            2,
+        )
+
+    def test_payment_history_and_order_date_amount_filters(self):
+        order = self.create_order(payment_method="upi")
+        payment = RazorpayPayment.objects.create(
+            order=order,
+            idempotency_key="payment-history",
+            request_hash="payment-history-hash",
+            gateway_order_id="order_history",
+            gateway_payment_id="payment_history",
+            amount=order.total,
+            status=RazorpayPayment.Status.CAPTURED,
+        )
+        self.authenticate(self.staff_token)
+        payments = self.client.get("/api/v1/admin/payments/?status=captured")
+        self.assertEqual(payments.status_code, 200, payments.data)
+        self.assertEqual(payments.data["count"], 1)
+        self.assertEqual(
+            payments.data["results"][0]["gatewayPaymentId"], "payment_history"
+        )
+        payment_detail = self.client.get(
+            f"/api/v1/admin/payments/{payment.pk}/"
+        )
+        self.assertEqual(payment_detail.status_code, 200)
+        self.assertEqual(payment_detail.data["orderId"], order.order_number)
+        self.assertNotIn("idempotencyKey", payment_detail.data)
+
+        in_range = self.client.get(
+            "/api/v1/admin/orders/?minimumTotal=998&maximumTotal=998"
+        )
+        self.assertEqual(in_range.status_code, 200)
+        self.assertEqual(in_range.data["count"], 1)
+        out_of_range = self.client.get(
+            "/api/v1/admin/orders/?minimumTotal=1000"
+        )
+        self.assertEqual(out_of_range.data["count"], 0)
+        bad_range = self.client.get(
+            "/api/v1/admin/orders/?minimumTotal=1000&maximumTotal=50"
+        )
+        self.assertEqual(bad_range.status_code, 400)
+        naive_date = self.client.get(
+            "/api/v1/admin/orders/?createdAfter=2026-10-14T10:00:00"
+        )
+        self.assertEqual(naive_date.status_code, 400)
+
+    def test_openapi_documents_auth_admin_and_public_health_routes(self):
+        schema = self.client.get("/api/schema/?format=json")
+        self.assertEqual(schema.status_code, 200, schema.content[:500])
+        self.assertIn("/api/v1/auth/register/", schema.data["paths"])
+        self.assertIn("/api/v1/auth/profile/", schema.data["paths"])
+        self.assertIn("/api/v1/admin/payments/", schema.data["paths"])
+        self.assertIn("/api/v1/admin/dashboard/", schema.data["paths"])
+        paths = schema.data["paths"]
+        self.assertIn("/api/v1/cart/items", paths)
+        self.assertIn("post", paths["/api/v1/cart/items"])
+        self.assertNotIn("post", paths["/api/v1/cart"])
+        self.assertEqual(
+            set(paths["/api/v1/cart/items/{item_id}"]),
+            {"patch", "delete"},
+        )
+        self.assertEqual(set(paths["/api/v1/cart"]), {"get", "delete"})
+        self.assertEqual(
+            set(paths["/api/v1/orders"]),
+            {"get", "post"},
+        )
+        self.assertNotIn("/api/v1/cart/", paths)
+        cart_headers = {
+            parameter["name"]
+            for parameter in paths["/api/v1/cart"]["get"]["parameters"]
+        }
+        self.assertIn("X-Guest-ID", cart_headers)
+        checkout_headers = {
+            parameter["name"]
+            for parameter in paths[
+                "/api/v1/orders/{order_number}/payment/"
+            ]["post"]["parameters"]
+        }
+        self.assertIn("Idempotency-Key", checkout_headers)
+        self.assertTrue(
+            paths["/api/v1/admin/dashboard/"]["get"].get("security")
+        )
+        self.assertEqual(
+            self.client.get("/").json(),
+            {"service": "Naksha API", "status": "ok"},
+        )
+        self.assertEqual(self.client.get("/health/").json(), {"status": "ok"})
+
+    def test_production_check_rejects_unsafe_configuration(self):
+        from apps.backoffice.checks import check_production_configuration
+
+        with override_settings(
+            DEBUG=False,
+            ALLOWED_HOSTS=[],
+            DATABASES={
+                "default": {
+                    "ENGINE": "django.db.backends.sqlite3",
+                    "NAME": ":memory:",
+                }
+            },
+            SESSION_COOKIE_SECURE=False,
+            CSRF_COOKIE_SECURE=False,
+            SECURE_SSL_REDIRECT=False,
+            SECURE_HSTS_SECONDS=0,
+            RAZORPAY_KEY_ID="rzp_live_never-allowed",
+        ):
+            issues = check_production_configuration(None)
+        issue_ids = {issue.id for issue in issues}
+        self.assertTrue(
+            {
+                "backoffice.E001",
+                "backoffice.E002",
+                "backoffice.E003",
+                "backoffice.W001",
+                "backoffice.W002",
+                "backoffice.E004",
+            }.issubset(issue_ids)
+        )
 
     def test_refresh_rotates_and_logout_blacklists_refresh_token(self):
         login = self.client.post(

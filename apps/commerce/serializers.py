@@ -55,6 +55,36 @@ class CartQuantitySerializer(serializers.Serializer):
     quantity = serializers.IntegerField(min_value=1)
 
 
+class CartItemResponseSerializer(serializers.Serializer):
+    cartItemId = serializers.CharField()
+    productId = serializers.CharField()
+    name = serializers.CharField()
+    slug = serializers.CharField()
+    price = serializers.FloatField()
+    originalPrice = serializers.FloatField(allow_null=True)
+    category = serializers.CharField()
+    image = serializers.CharField()
+    selectedSize = serializers.CharField()
+    selectedCup = serializers.CharField()
+    selectedColor = serializers.CharField()
+    colorHex = serializers.CharField()
+    quantity = serializers.IntegerField()
+
+
+class CartResponseSerializer(serializers.Serializer):
+    items = CartItemResponseSerializer(many=True)
+    subtotal = serializers.FloatField()
+    totalSavings = serializers.FloatField()
+    shippingFee = serializers.FloatField()
+    total = serializers.FloatField()
+    freeShipping = serializers.DictField()
+
+
+class CartQuoteResponseSerializer(CartResponseSerializer):
+    discountAmount = serializers.FloatField()
+    couponCode = serializers.CharField()
+
+
 class ShippingAddressSerializer(serializers.Serializer):
     fullName = serializers.CharField(max_length=120)
     phone = serializers.CharField(max_length=24)

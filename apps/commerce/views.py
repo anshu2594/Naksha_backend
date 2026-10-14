@@ -4,11 +4,13 @@ from uuid import UUID
 from django.db import transaction
 from django.db.models import F
 from django.shortcuts import get_object_or_404
-from rest_framework import status
+from rest_framework import serializers, status
 from rest_framework.exceptions import APIException, ValidationError
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import OpenApiParameter, extend_schema, inline_serializer
 
 from apps.catalog.models import Product
 from apps.catalog.serializers import ProductSerializer
@@ -28,12 +30,21 @@ from .promotions import coupon_discount, get_current_offer
 from .serializers import (
     CartItemWriteSerializer,
     CartQuantitySerializer,
+    CartQuoteResponseSerializer,
+    CartResponseSerializer,
     OrderCreateSerializer,
     OrderSerializer,
 )
 
 FREE_SHIPPING_THRESHOLD = Decimal("999.00")
 SHIPPING_FEE = Decimal("99.00")
+GUEST_ID_PARAMETER = OpenApiParameter(
+    name="X-Guest-ID",
+    type=OpenApiTypes.UUID,
+    location=OpenApiParameter.HEADER,
+    required=True,
+    description="UUID returned by POST /api/v1/session/.",
+)
 
 
 class Conflict(APIException):
@@ -122,6 +133,14 @@ class GuestSessionView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
 
+    @extend_schema(
+        request=None,
+        responses=inline_serializer(
+            name="GuestSessionCreated",
+            fields={"guestId": serializers.UUIDField()},
+        ),
+        operation_id="guest_session_create",
+    )
     def post(self, request):
         guest = GuestSession.objects.create()
         return Response({"guestId": str(guest.id)}, status=status.HTTP_201_CREATED)
@@ -131,9 +150,18 @@ class CartView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
 
+    @extend_schema(
+        parameters=[GUEST_ID_PARAMETER],
+        responses=CartResponseSerializer,
+    )
     def get(self, request):
         return Response(cart_payload(get_guest(request)))
 
+    @extend_schema(
+        request=CartItemWriteSerializer,
+        parameters=[GUEST_ID_PARAMETER],
+        responses=CartResponseSerializer,
+    )
     def post(self, request):
         guest = get_guest(request)
         serializer = CartItemWriteSerializer(data=request.data)
@@ -154,6 +182,11 @@ class CartView(APIView):
                 )
         return Response(cart_payload(guest), status=status.HTTP_200_OK)
 
+    @extend_schema(
+        request=CartQuantitySerializer,
+        parameters=[GUEST_ID_PARAMETER],
+        responses=CartResponseSerializer,
+    )
     def patch(self, request, item_id=None):
         guest = get_guest(request)
         if item_id is None:
@@ -165,6 +198,10 @@ class CartView(APIView):
         item.save(update_fields=["quantity", "updated_at"])
         return Response(cart_payload(guest))
 
+    @extend_schema(
+        parameters=[GUEST_ID_PARAMETER],
+        responses=CartResponseSerializer,
+    )
     def delete(self, request, item_id=None):
         guest = get_guest(request)
         if item_id is None:
@@ -178,6 +215,15 @@ class CartQuoteView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
 
+    @extend_schema(
+        parameters=[GUEST_ID_PARAMETER],
+        request=inline_serializer(
+            name="CouponQuoteRequest",
+            fields={"couponCode": serializers.CharField(max_length=32)},
+        ),
+        responses=CartQuoteResponseSerializer,
+        operation_id="guest_cart_coupon_quote",
+    )
     def post(self, request):
         guest = get_guest(request)
         code = str(request.data.get("couponCode", "")).strip()
@@ -206,6 +252,18 @@ class WishlistView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
 
+    @extend_schema(
+        request=None,
+        parameters=[GUEST_ID_PARAMETER],
+        responses=inline_serializer(
+            name="GuestWishlist",
+            fields={
+                "products": ProductSerializer(many=True),
+                "productIds": serializers.ListField(child=serializers.CharField()),
+            },
+        ),
+        operation_id="guest_wishlist_retrieve",
+    )
     def get(self, request):
         guest = get_guest(request)
         products = Product.objects.filter(
@@ -218,6 +276,17 @@ class WishlistView(APIView):
             }
         )
 
+    @extend_schema(
+        parameters=[GUEST_ID_PARAMETER],
+        responses=inline_serializer(
+            name="GuestWishlistCleared",
+            fields={
+                "products": ProductSerializer(many=True),
+                "productIds": serializers.ListField(child=serializers.CharField()),
+            },
+        ),
+        operation_id="guest_wishlist_clear",
+    )
     def delete(self, request):
         WishlistItem.objects.filter(guest=get_guest(request)).delete()
         return Response({"products": [], "productIds": []})
@@ -227,6 +296,18 @@ class WishlistToggleView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
 
+    @extend_schema(
+        request=None,
+        parameters=[GUEST_ID_PARAMETER],
+        responses=inline_serializer(
+            name="GuestWishlistToggle",
+            fields={
+                "added": serializers.BooleanField(),
+                "productIds": serializers.ListField(child=serializers.CharField()),
+            },
+        ),
+        operation_id="guest_wishlist_toggle",
+    )
     def post(self, request, product_id):
         guest = get_guest(request)
         product = get_object_or_404(Product, pk=product_id, is_active=True)
@@ -248,11 +329,22 @@ class OrderListCreateView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
 
+    @extend_schema(
+        parameters=[GUEST_ID_PARAMETER],
+        responses=OrderSerializer(many=True),
+        operation_id="guest_order_list",
+    )
     def get(self, request):
         guest = get_guest(request)
         orders = Order.objects.filter(guest=guest).prefetch_related("items")
         return Response(OrderSerializer(orders, many=True).data)
 
+    @extend_schema(
+        parameters=[GUEST_ID_PARAMETER],
+        request=OrderCreateSerializer,
+        responses={201: OrderSerializer},
+        operation_id="guest_order_create",
+    )
     def post(self, request):
         guest = get_guest(request)
         serializer = OrderCreateSerializer(data=request.data)
@@ -397,6 +489,12 @@ class OrderDetailView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
 
+    @extend_schema(
+        request=None,
+        parameters=[GUEST_ID_PARAMETER],
+        responses=OrderSerializer,
+        operation_id="guest_order_retrieve",
+    )
     def get(self, request, order_number):
         order = get_object_or_404(
             Order.objects.prefetch_related("items"),
@@ -410,6 +508,12 @@ class OrderCancelView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
 
+    @extend_schema(
+        request=None,
+        parameters=[GUEST_ID_PARAMETER],
+        responses=OrderSerializer,
+        operation_id="guest_order_cancel",
+    )
     def post(self, request, order_number):
         order = get_object_or_404(
             Order.objects.prefetch_related("items"),

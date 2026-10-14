@@ -1,4 +1,8 @@
 from decimal import Decimal
+from decimal import InvalidOperation
+from uuid import UUID
+
+from django.contrib.auth import get_user_model
 
 from django.db import transaction
 from django.db.models import Count, OuterRef, Q, Subquery, Sum
@@ -6,8 +10,9 @@ from django.db.models.deletion import ProtectedError
 from django.middleware.csrf import get_token
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from uuid import UUID
-from rest_framework import generics, status
+from django.utils.dateparse import parse_datetime
+from django.utils.timezone import is_aware
+from rest_framework import generics, serializers, status
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.exceptions import APIException, ValidationError
 from rest_framework.parsers import FormParser, MultiPartParser
@@ -18,13 +23,26 @@ from rest_framework.pagination import LimitOffsetPagination
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import (
+    OpenApiParameter,
+    extend_schema,
+    extend_schema_view,
+    inline_serializer,
+)
 
 from apps.catalog.models import Category, Product, ProductImage
+from apps.backoffice.accounts import (
+    RegisteredCustomerAdminSerializer,
+    RegisteredCustomerAdminUpdateSerializer,
+)
+from apps.backoffice.models import CustomerProfile
 from apps.commerce.inventory import release_order_inventory
 from apps.commerce.models import (
     DiscountOffer,
     GuestSession,
     Order,
+    OrderItem,
     OrderStatusHistory,
     PaymentRefund,
     RazorpayPayment,
@@ -33,6 +51,7 @@ from apps.commerce.serializers import OrderSerializer
 
 from .serializers import (
     AdminOrderSerializer,
+    AdminPaymentSerializer,
     CategoryAdminSerializer,
     CustomerSerializer,
     DiscountOfferSerializer,
@@ -44,6 +63,8 @@ from .serializers import (
     ProductImageUploadSerializer,
     RefundCreateSerializer,
 )
+
+User = get_user_model()
 
 
 class Conflict(APIException):
@@ -71,6 +92,19 @@ class UserProfileView(APIView):
     authentication_classes = [JWTAuthentication, SessionAuthentication]
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        responses=inline_serializer(
+            name="AuthenticatedUserProfile",
+            fields={
+                "id": serializers.IntegerField(),
+                "username": serializers.CharField(),
+                "email": serializers.EmailField(allow_blank=True),
+                "role": serializers.ChoiceField(choices=["staff", "customer"]),
+                "isStaff": serializers.BooleanField(),
+            },
+        ),
+        operation_id="auth_current_user",
+    )
     def get(self, request):
         user = request.user
         return Response(
@@ -88,6 +122,14 @@ class LogoutView(APIView):
     authentication_classes = [JWTAuthentication, SessionAuthentication]
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        request=inline_serializer(
+            name="LogoutRequest",
+            fields={"refresh": serializers.CharField()},
+        ),
+        responses={204: None},
+        operation_id="auth_logout",
+    )
     def post(self, request):
         token_value = request.data.get("refresh", "")
         if not isinstance(token_value, str) or not token_value:
@@ -103,6 +145,17 @@ class LogoutView(APIView):
 
 
 class AdminSessionView(StaffAPIView):
+    @extend_schema(
+        responses=inline_serializer(
+            name="AdminSession",
+            fields={
+                "isStaff": serializers.BooleanField(),
+                "username": serializers.CharField(),
+                "csrfToken": serializers.CharField(),
+            },
+        ),
+        operation_id="admin_session",
+    )
     def get(self, request):
         return Response(
             {"isStaff": True, "username": request.user.get_username(), "csrfToken": get_token(request)}
@@ -110,8 +163,43 @@ class AdminSessionView(StaffAPIView):
 
 
 class DashboardView(StaffAPIView):
+    @extend_schema(
+        responses=inline_serializer(
+            name="AdminDashboard",
+            fields={
+                "orders": serializers.IntegerField(),
+                "pendingOrders": serializers.IntegerField(),
+                "customers": serializers.IntegerField(),
+                "activeProducts": serializers.IntegerField(),
+                "revenue": serializers.DecimalField(max_digits=12, decimal_places=2),
+                "totalProducts": serializers.IntegerField(),
+                "totalCustomers": serializers.IntegerField(),
+                "registeredCustomers": serializers.IntegerField(),
+                "totalOrders": serializers.IntegerField(),
+                "totalSales": serializers.DecimalField(max_digits=12, decimal_places=2),
+                "successfulPayments": serializers.IntegerField(),
+                "pendingPayments": serializers.IntegerField(),
+                "failedPayments": serializers.IntegerField(),
+                "activeOffers": serializers.IntegerField(),
+                "scheduledOffers": serializers.IntegerField(),
+                "recentOrders": AdminOrderSerializer(many=True),
+                "bestSellingProducts": inline_serializer(
+                    name="BestSellingProduct",
+                    fields={
+                        "productId": serializers.CharField(),
+                        "name": serializers.CharField(),
+                        "unitsSold": serializers.IntegerField(),
+                    },
+                    many=True,
+                ),
+                "asOf": serializers.DateTimeField(),
+            },
+        ),
+        operation_id="admin_dashboard",
+    )
     def get(self, request):
         orders = Order.objects.all()
+        now = timezone.now()
         paid_states = [
             Order.PaymentStatus.PAID,
             Order.PaymentStatus.PARTIALLY_REFUNDED,
@@ -123,16 +211,71 @@ class DashboardView(StaffAPIView):
         refunds = PaymentRefund.objects.filter(
             status=PaymentRefund.Status.PROCESSED
         ).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+        guest_customer_count = GuestSession.objects.filter(
+            orders__isnull=False
+        ).distinct().count()
+        registered_customer_count = User.objects.filter(is_staff=False).count()
+        recent_orders = Order.objects.select_related("guest").prefetch_related(
+            "items"
+        )[:5]
+        best_selling_products = (
+            OrderItem.objects.filter(
+                order__status__in=[
+                    Order.Status.PROCESSING,
+                    Order.Status.SHIPPED,
+                    Order.Status.DELIVERED,
+                ]
+            )
+            .values("product_id_snapshot", "name")
+            .annotate(unitsSold=Sum("quantity"))
+            .order_by("-unitsSold", "name")[:5]
+        )
+        active_offers = DiscountOffer.objects.filter(
+            is_active=True,
+            starts_at__lte=now,
+            ends_at__gt=now,
+        )
+        scheduled_offers = DiscountOffer.objects.filter(
+            is_active=True,
+            starts_at__gt=now,
+            ends_at__gt=now,
+        )
+        revenue = str(max(Decimal("0.00"), gross_paid - refunds))
         return Response(
             {
                 "orders": orders.count(),
                 "pendingOrders": orders.filter(status=Order.Status.PENDING).count(),
-                "customers": GuestSession.objects.filter(orders__isnull=False)
-                .distinct()
-                .count(),
+                "customers": guest_customer_count,
                 "activeProducts": Product.objects.filter(is_active=True).count(),
-                "revenue": str(max(Decimal("0.00"), gross_paid - refunds)),
-                "asOf": timezone.now(),
+                "revenue": revenue,
+                "totalProducts": Product.objects.count(),
+                "totalCustomers": guest_customer_count + registered_customer_count,
+                "registeredCustomers": registered_customer_count,
+                "totalOrders": orders.count(),
+                "totalSales": revenue,
+                "successfulPayments": RazorpayPayment.objects.filter(
+                    status=RazorpayPayment.Status.CAPTURED
+                ).count(),
+                "pendingPayments": RazorpayPayment.objects.filter(
+                    status=RazorpayPayment.Status.CREATED
+                ).count(),
+                "failedPayments": RazorpayPayment.objects.filter(
+                    status=RazorpayPayment.Status.FAILED
+                ).count(),
+                "activeOffers": active_offers.count(),
+                "scheduledOffers": scheduled_offers.count(),
+                "recentOrders": AdminOrderSerializer(
+                    recent_orders, many=True, context={"request": request}
+                ).data,
+                "bestSellingProducts": [
+                    {
+                        "productId": row["product_id_snapshot"],
+                        "name": row["name"],
+                        "unitsSold": row["unitsSold"],
+                    }
+                    for row in best_selling_products
+                ],
+                "asOf": now,
             }
         )
 
@@ -153,6 +296,17 @@ class CategoryDetailView(StaffDetailAPIView):
             raise Conflict("Categories with products cannot be deleted.") from exc
 
 
+@extend_schema_view(
+    get=extend_schema(
+        parameters=[
+            OpenApiParameter("search", OpenApiTypes.STR, OpenApiParameter.QUERY),
+            OpenApiParameter("category", OpenApiTypes.STR, OpenApiParameter.QUERY),
+            OpenApiParameter("active", OpenApiTypes.BOOL, OpenApiParameter.QUERY),
+            OpenApiParameter("limit", OpenApiTypes.INT, OpenApiParameter.QUERY),
+            OpenApiParameter("offset", OpenApiTypes.INT, OpenApiParameter.QUERY),
+        ]
+    )
+)
 class ProductListCreateView(StaffListCreateAPIView):
     serializer_class = ProductAdminSerializer
 
@@ -183,6 +337,10 @@ class ProductDetailAdminView(StaffDetailAPIView):
     serializer_class = ProductAdminSerializer
 
     def perform_destroy(self, instance):
+        if OrderItem.objects.filter(product=instance).exists():
+            raise Conflict(
+                "Products in order history cannot be deleted; deactivate them instead."
+            )
         image_paths = list(instance.uploaded_images.values_list("image", flat=True))
         try:
             instance.delete()
@@ -197,6 +355,10 @@ class ProductDetailAdminView(StaffDetailAPIView):
 class ProductImageListCreateView(StaffAPIView):
     parser_classes = [MultiPartParser, FormParser]
 
+    @extend_schema(
+        responses=ProductImageSerializer(many=True),
+        operation_id="admin_product_images_list",
+    )
     def get(self, request, product_id):
         product = get_object_or_404(Product, pk=product_id)
         return Response(
@@ -205,6 +367,21 @@ class ProductImageListCreateView(StaffAPIView):
             ).data
         )
 
+    @extend_schema(
+        request=inline_serializer(
+            name="ProductImageUpload",
+            fields={
+                "images": serializers.ListField(
+                    child=serializers.ImageField(), required=False
+                ),
+                "image": serializers.ImageField(required=False),
+                "altText": serializers.CharField(required=False, allow_blank=True),
+                "sortOrder": serializers.IntegerField(required=False, min_value=0),
+            },
+        ),
+        responses={201: ProductImageSerializer(many=True)},
+        operation_id="admin_product_images_upload",
+    )
     def post(self, request, product_id):
         product = get_object_or_404(Product, pk=product_id)
         files = request.FILES.getlist("images") or request.FILES.getlist("image")
@@ -237,6 +414,10 @@ class ProductImageListCreateView(StaffAPIView):
 
 
 class ProductImageDetailView(StaffAPIView):
+    @extend_schema(
+        responses={204: None},
+        operation_id="admin_product_image_delete",
+    )
     def delete(self, request, product_id, image_id):
         image = get_object_or_404(
             ProductImage, pk=image_id, product_id=product_id
@@ -249,6 +430,23 @@ class ProductImageDetailView(StaffAPIView):
 class CustomerListView(StaffAPIView):
     pagination_class = LimitOffsetPagination
 
+    @extend_schema(
+        parameters=[
+            OpenApiParameter("search", OpenApiTypes.STR, OpenApiParameter.QUERY),
+            OpenApiParameter("limit", OpenApiTypes.INT, OpenApiParameter.QUERY),
+            OpenApiParameter("offset", OpenApiTypes.INT, OpenApiParameter.QUERY),
+        ],
+        responses=inline_serializer(
+            name="GuestCustomerPage",
+            fields={
+                "count": serializers.IntegerField(),
+                "next": serializers.URLField(allow_null=True),
+                "previous": serializers.URLField(allow_null=True),
+                "results": CustomerSerializer(many=True),
+            },
+        ),
+        operation_id="admin_guest_customer_list",
+    )
     def get(self, request):
         recent_order = Order.objects.filter(guest_id=OuterRef("pk")).order_by(
             "-created_at"
@@ -295,9 +493,111 @@ class CustomerListView(StaffAPIView):
         return paginator.get_paginated_response(CustomerSerializer(page, many=True).data)
 
 
+class RegisteredCustomerListView(StaffAPIView):
+    pagination_class = LimitOffsetPagination
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter("search", OpenApiTypes.STR, OpenApiParameter.QUERY),
+            OpenApiParameter("active", OpenApiTypes.BOOL, OpenApiParameter.QUERY),
+            OpenApiParameter("limit", OpenApiTypes.INT, OpenApiParameter.QUERY),
+            OpenApiParameter("offset", OpenApiTypes.INT, OpenApiParameter.QUERY),
+        ],
+        responses=inline_serializer(
+            name="RegisteredCustomerPage",
+            fields={
+                "count": serializers.IntegerField(),
+                "next": serializers.URLField(allow_null=True),
+                "previous": serializers.URLField(allow_null=True),
+                "results": RegisteredCustomerAdminSerializer(many=True),
+            },
+        ),
+        operation_id="admin_registered_customer_list",
+    )
+    def get(self, request):
+        customers = User.objects.filter(is_staff=False).select_related(
+            "customer_profile"
+        )
+        search = request.query_params.get("search", "").strip()
+        if search:
+            customers = customers.filter(
+                Q(username__icontains=search)
+                | Q(email__icontains=search)
+                | Q(first_name__icontains=search)
+                | Q(last_name__icontains=search)
+                | Q(customer_profile__phone__icontains=search)
+            )
+        active = request.query_params.get("active")
+        if active in {"true", "false"}:
+            customers = customers.filter(is_active=active == "true")
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(customers.order_by("-date_joined"), request, view=self)
+        return paginator.get_paginated_response(
+            RegisteredCustomerAdminSerializer(page, many=True).data
+        )
+
+
+class RegisteredCustomerDetailView(StaffAPIView):
+    serializer_class = RegisteredCustomerAdminSerializer
+
+    def get_customer(self, customer_id):
+        return get_object_or_404(
+            User.objects.filter(is_staff=False).select_related("customer_profile"),
+            pk=customer_id,
+        )
+
+    @extend_schema(
+        responses=RegisteredCustomerAdminSerializer,
+        operation_id="admin_registered_customer_retrieve",
+    )
+    def get(self, request, customer_id):
+        return Response(
+            RegisteredCustomerAdminSerializer(
+                self.get_customer(customer_id)
+            ).data
+        )
+
+    @extend_schema(
+        request=RegisteredCustomerAdminUpdateSerializer,
+        responses=RegisteredCustomerAdminSerializer,
+        operation_id="admin_registered_customer_update",
+    )
+    def patch(self, request, customer_id):
+        customer = self.get_customer(customer_id)
+        serializer = RegisteredCustomerAdminUpdateSerializer(
+            customer, data=request.data, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(RegisteredCustomerAdminSerializer(customer).data)
+
+
 class OrderListAdminView(StaffAPIView):
     pagination_class = LimitOffsetPagination
 
+    @extend_schema(
+        parameters=[
+            OpenApiParameter("status", OpenApiTypes.STR, OpenApiParameter.QUERY),
+            OpenApiParameter("paymentStatus", OpenApiTypes.STR, OpenApiParameter.QUERY),
+            OpenApiParameter("search", OpenApiTypes.STR, OpenApiParameter.QUERY),
+            OpenApiParameter("createdAfter", OpenApiTypes.DATETIME, OpenApiParameter.QUERY),
+            OpenApiParameter("createdBefore", OpenApiTypes.DATETIME, OpenApiParameter.QUERY),
+            OpenApiParameter("minimumTotal", OpenApiTypes.DECIMAL, OpenApiParameter.QUERY),
+            OpenApiParameter("maximumTotal", OpenApiTypes.DECIMAL, OpenApiParameter.QUERY),
+            OpenApiParameter("limit", OpenApiTypes.INT, OpenApiParameter.QUERY),
+            OpenApiParameter("offset", OpenApiTypes.INT, OpenApiParameter.QUERY),
+        ],
+        responses=inline_serializer(
+            name="AdminOrderPage",
+            fields={
+                "count": serializers.IntegerField(),
+                "next": serializers.URLField(allow_null=True),
+                "previous": serializers.URLField(allow_null=True),
+                "results": AdminOrderSerializer(many=True),
+            },
+        ),
+        operation_id="admin_order_list",
+    )
     def get(self, request):
         orders = Order.objects.select_related("guest").prefetch_related("items")
         order_status = request.query_params.get("status")
@@ -314,6 +614,45 @@ class OrderListAdminView(StaffAPIView):
                 | Q(shipping_address__phone__icontains=search)
                 | Q(guest_id__icontains=search)
             )
+        for parameter, lookup in (
+            ("createdAfter", "created_at__gte"),
+            ("createdBefore", "created_at__lte"),
+        ):
+            value = request.query_params.get(parameter)
+            if value:
+                parsed = parse_datetime(value)
+                if parsed is None or not is_aware(parsed):
+                    raise ValidationError(
+                        {parameter: "Provide an ISO-8601 datetime with a timezone."}
+                    )
+                orders = orders.filter(**{lookup: parsed})
+        totals = {}
+        for parameter, lookup in (
+            ("minimumTotal", "total__gte"),
+            ("maximumTotal", "total__lte"),
+        ):
+            value = request.query_params.get(parameter)
+            if value:
+                try:
+                    amount = Decimal(value)
+                except InvalidOperation as exc:
+                    raise ValidationError(
+                        {parameter: "Provide a valid non-negative decimal amount."}
+                    ) from exc
+                if not amount.is_finite() or amount < 0:
+                    raise ValidationError(
+                        {parameter: "Provide a valid non-negative decimal amount."}
+                    )
+                totals[parameter] = amount
+                orders = orders.filter(**{lookup: amount})
+        if (
+            "minimumTotal" in totals
+            and "maximumTotal" in totals
+            and totals["minimumTotal"] > totals["maximumTotal"]
+        ):
+            raise ValidationError(
+                {"maximumTotal": "Must be greater than or equal to minimumTotal."}
+            )
         paginator = self.pagination_class()
         page = paginator.paginate_queryset(orders, request, view=self)
         return paginator.get_paginated_response(
@@ -322,6 +661,10 @@ class OrderListAdminView(StaffAPIView):
 
 
 class OrderDetailAdminView(StaffAPIView):
+    @extend_schema(
+        responses=OrderDetailAdminSerializer,
+        operation_id="admin_order_retrieve",
+    )
     def get(self, request, order_number):
         order = get_object_or_404(
             Order.objects.prefetch_related("items", "status_history__changed_by"),
@@ -332,7 +675,71 @@ class OrderDetailAdminView(StaffAPIView):
         )
 
 
+class PaymentListAdminView(StaffAPIView):
+    pagination_class = LimitOffsetPagination
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter("status", OpenApiTypes.STR, OpenApiParameter.QUERY),
+            OpenApiParameter("search", OpenApiTypes.STR, OpenApiParameter.QUERY),
+            OpenApiParameter("limit", OpenApiTypes.INT, OpenApiParameter.QUERY),
+            OpenApiParameter("offset", OpenApiTypes.INT, OpenApiParameter.QUERY),
+        ],
+        responses=inline_serializer(
+            name="AdminPaymentPage",
+            fields={
+                "count": serializers.IntegerField(),
+                "next": serializers.URLField(allow_null=True),
+                "previous": serializers.URLField(allow_null=True),
+                "results": AdminPaymentSerializer(many=True),
+            },
+        ),
+        operation_id="admin_payment_list",
+    )
+    def get(self, request):
+        payments = RazorpayPayment.objects.select_related("order").prefetch_related(
+            "order__refunds"
+        )
+        payment_status = request.query_params.get("status")
+        search = request.query_params.get("search", "").strip()
+        if payment_status:
+            payments = payments.filter(status=payment_status.lower())
+        if search:
+            payments = payments.filter(
+                Q(order__order_number__icontains=search)
+                | Q(gateway_order_id__icontains=search)
+                | Q(gateway_payment_id__icontains=search)
+            )
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(
+            payments.order_by("-created_at"), request, view=self
+        )
+        return paginator.get_paginated_response(
+            AdminPaymentSerializer(page, many=True).data
+        )
+
+
+class PaymentDetailAdminView(StaffAPIView):
+    @extend_schema(
+        responses=AdminPaymentSerializer,
+        operation_id="admin_payment_retrieve",
+    )
+    def get(self, request, payment_id):
+        payment = get_object_or_404(
+            RazorpayPayment.objects.select_related("order").prefetch_related(
+                "order__refunds"
+            ),
+            pk=payment_id,
+        )
+        return Response(AdminPaymentSerializer(payment).data)
+
+
 class OrderStatusView(StaffAPIView):
+    @extend_schema(
+        request=OrderStatusUpdateSerializer,
+        responses=OrderSerializer,
+        operation_id="admin_order_status_update",
+    )
     def patch(self, request, order_number):
         serializer = OrderStatusUpdateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -411,6 +818,19 @@ class OfferDetailView(StaffDetailAPIView):
 
 
 class OrderRefundView(StaffAPIView):
+    @extend_schema(
+        request=RefundCreateSerializer,
+        parameters=[
+            OpenApiParameter(
+                "Idempotency-Key",
+                OpenApiTypes.STR,
+                OpenApiParameter.HEADER,
+                required=True,
+            )
+        ],
+        responses={202: PaymentRefundSerializer},
+        operation_id="admin_order_refund",
+    )
     def post(self, request, order_number):
         order = get_object_or_404(
             Order.objects.prefetch_related("refunds"), order_number=order_number

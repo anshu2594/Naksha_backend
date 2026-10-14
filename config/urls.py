@@ -4,6 +4,7 @@ from django.conf.urls.static import static
 from django.http import JsonResponse
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
+from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 
 from apps.catalog.views import CategoryViewSet, ProductViewSet
 from apps.commerce.views import (
@@ -43,6 +44,12 @@ urlpatterns = [
     path("health/", health_check, name="health-check"),
     path("admin/", admin.site.urls),
     path("api/v1/", include(router.urls)),
+    path("api/schema/", SpectacularAPIView.as_view(), name="openapi-schema"),
+    path(
+        "api/docs/",
+        SpectacularSwaggerView.as_view(url_name="openapi-schema"),
+        name="swagger-ui",
+    ),
     path("api/v1/auth/", include("apps.backoffice.auth_urls")),
     path("api/v1/admin/", include("apps.backoffice.urls")),
     path("api/v1/session/", GuestSessionView.as_view(), name="guest-session"),
