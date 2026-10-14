@@ -13,7 +13,18 @@ from rest_framework.views import APIView
 from apps.catalog.models import Product
 from apps.catalog.serializers import ProductSerializer
 
-from .models import CartItem, GuestSession, Order, OrderItem, WishlistItem
+from .models import (
+    CartItem,
+    DiscountOffer,
+    GuestSession,
+    Order,
+    OrderItem,
+    OrderStatusHistory,
+    RazorpayPayment,
+    WishlistItem,
+)
+from .inventory import release_order_inventory
+from .promotions import coupon_discount, get_current_offer
 from .serializers import (
     CartItemWriteSerializer,
     CartQuantitySerializer,
@@ -163,6 +174,34 @@ class CartView(APIView):
         return Response(cart_payload(guest))
 
 
+class CartQuoteView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        guest = get_guest(request)
+        code = str(request.data.get("couponCode", "")).strip()
+        payload = cart_payload(guest)
+        if not code:
+            raise ValidationError({"couponCode": "Enter a coupon code."})
+        subtotal = Decimal(str(payload["subtotal"]))
+        offer = get_current_offer(code)
+        if offer is None:
+            raise ValidationError({"couponCode": "This coupon is not available."})
+        discount = coupon_discount(offer, subtotal)
+        if discount is None:
+            raise ValidationError(
+                {"couponCode": "The cart does not meet this coupon's minimum order value."}
+            )
+        payload["discountAmount"] = float(discount)
+        payload["couponCode"] = offer.code
+        payload["total"] = float(
+            max(Decimal("0.00"), subtotal - discount)
+            + Decimal(str(payload["shippingFee"]))
+        )
+        return Response(payload)
+
+
 class WishlistView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
@@ -245,6 +284,37 @@ class OrderListCreateView(APIView):
                 order_lines = submitted_items
                 cart_items = []
 
+            quantities = {}
+            for line in order_lines:
+                product_id = line["product"].pk
+                quantities[product_id] = quantities.get(product_id, 0) + line["quantity"]
+            locked_products = {
+                product.pk: product
+                for product in Product.objects.select_for_update()
+                .filter(pk__in=sorted(quantities))
+                .order_by("pk")
+            }
+            if len(locked_products) != len(quantities):
+                raise ValidationError({"items": "A product is no longer available."})
+
+            for line in order_lines:
+                product = locked_products[line["product"].pk]
+                if not product.is_active:
+                    raise ValidationError(
+                        {"items": f"{product.name} is no longer available."}
+                    )
+                line["product"] = product
+
+            for product_id, quantity in quantities.items():
+                product = locked_products[product_id]
+                if (
+                    product.stock_quantity is not None
+                    and product.stock_quantity < quantity
+                ):
+                    raise Conflict(
+                        f"Only {product.stock_quantity} unit(s) of {product.name} remain."
+                    )
+
             subtotal = sum(
                 (
                     line["product"].price * line["quantity"]
@@ -252,6 +322,22 @@ class OrderListCreateView(APIView):
                 ),
                 Decimal("0.00"),
             )
+            offer = None
+            discount_amount = Decimal("0.00")
+            coupon_code = values.get("couponCode", "").strip()
+            if coupon_code:
+                offer = get_current_offer(coupon_code, lock=True)
+                if offer is None:
+                    raise ValidationError(
+                        {"couponCode": "This coupon is not available."}
+                    )
+                discount_amount = coupon_discount(offer, subtotal)
+                if discount_amount is None:
+                    raise ValidationError(
+                        {
+                            "couponCode": "The order does not meet this coupon's minimum order value."
+                        }
+                    )
             shipping_fee = (
                 Decimal("0.00")
                 if subtotal >= FREE_SHIPPING_THRESHOLD
@@ -264,10 +350,21 @@ class OrderListCreateView(APIView):
                 payment_status=Order.PaymentStatus.PENDING,
                 subtotal=subtotal,
                 shipping_fee=shipping_fee,
-                total=subtotal + shipping_fee,
+                discount_amount=discount_amount,
+                coupon_code=offer.code if offer else "",
+                offer=offer,
+                total=max(Decimal("0.00"), subtotal - discount_amount) + shipping_fee,
                 shipping_address=address,
                 discreet_package=address.get("discreetPackage", True),
             )
+            for product_id, quantity in quantities.items():
+                product = locked_products[product_id]
+                if product.stock_quantity is not None:
+                    product.stock_quantity -= quantity
+                    product.save(update_fields=["stock_quantity", "updated_at"])
+            if offer:
+                offer.usage_count += 1
+                offer.save(update_fields=["usage_count", "updated_at"])
             for line in order_lines:
                 product = line["product"]
                 color = line.get("selectedColor", "")
@@ -321,6 +418,29 @@ class OrderCancelView(APIView):
         )
         if order.status != Order.Status.PENDING:
             raise Conflict("Only pending orders can be cancelled.")
-        order.status = Order.Status.CANCELLED
-        order.save(update_fields=["status", "updated_at"])
+        if order.payment_status in {
+            Order.PaymentStatus.PAID,
+            Order.PaymentStatus.PARTIALLY_REFUNDED,
+        }:
+            raise Conflict("Refund paid orders before cancelling them.")
+        with transaction.atomic():
+            order = Order.objects.select_for_update().get(pk=order.pk)
+            if order.status != Order.Status.PENDING:
+                raise Conflict("Only pending orders can be cancelled.")
+            if order.payment_status in {
+                Order.PaymentStatus.PAID,
+                Order.PaymentStatus.PARTIALLY_REFUNDED,
+            }:
+                raise Conflict("Refund paid orders before cancelling them.")
+            if order.payments.filter(status=RazorpayPayment.Status.CREATED).exists():
+                raise Conflict("Resolve the active payment attempt before cancelling.")
+            release_order_inventory(order)
+            order.status = Order.Status.CANCELLED
+            order.save(update_fields=["status", "updated_at"])
+            OrderStatusHistory.objects.create(
+                order=order,
+                old_status=Order.Status.PENDING,
+                new_status=Order.Status.CANCELLED,
+                note="Cancelled by customer",
+            )
         return Response(OrderSerializer(order).data)

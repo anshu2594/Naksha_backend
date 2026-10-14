@@ -1,4 +1,9 @@
+import hashlib
+
 from django.db import models
+from django.utils.text import slugify
+
+from .validators import validate_product_image
 
 
 class Category(models.Model):
@@ -21,6 +26,7 @@ class Category(models.Model):
 
 class Product(models.Model):
     id = models.CharField(primary_key=True, max_length=40)
+    sku = models.CharField(max_length=40, unique=True, blank=True)
     name = models.CharField(max_length=200)
     slug = models.SlugField(unique=True, max_length=160)
     category = models.ForeignKey(
@@ -35,6 +41,8 @@ class Product(models.Model):
     review_count = models.PositiveIntegerField(default=0)
     is_best_seller = models.BooleanField(default=False)
     is_new = models.BooleanField(default=False)
+    is_featured = models.BooleanField(default=False)
+    stock_quantity = models.PositiveIntegerField(null=True, blank=True, default=None)
     padding = models.CharField(max_length=160, blank=True)
     wire = models.CharField(max_length=100, blank=True)
     fabric = models.CharField(max_length=200, blank=True)
@@ -74,3 +82,29 @@ class Product(models.Model):
 
     def __str__(self):
         return self.name
+
+    def save(self, *args, **kwargs):
+        if not self.sku:
+            product_id = str(self.id)
+            suffix = hashlib.sha256(product_id.encode()).hexdigest()[:6].upper()
+            sku_prefix = slugify(self.slug or product_id).upper()[:29]
+            self.sku = f"NAK-{sku_prefix}-{suffix}"
+        super().save(*args, **kwargs)
+
+
+class ProductImage(models.Model):
+    product = models.ForeignKey(
+        Product, related_name="uploaded_images", on_delete=models.CASCADE
+    )
+    image = models.ImageField(
+        upload_to="products/%Y/%m/", validators=[validate_product_image]
+    )
+    alt_text = models.CharField(max_length=200, blank=True)
+    sort_order = models.PositiveSmallIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["sort_order", "id"]
+
+    def __str__(self):
+        return f"{self.product_id}: {self.image.name}"

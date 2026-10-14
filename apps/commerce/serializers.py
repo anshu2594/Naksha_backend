@@ -78,6 +78,7 @@ class OrderCreateSerializer(serializers.Serializer):
     shippingAddress = ShippingAddressSerializer()
     paymentMethod = serializers.ChoiceField(choices=Order.PaymentMethod.choices)
     items = OrderItemWriteSerializer(many=True, required=False, allow_empty=False)
+    couponCode = serializers.CharField(max_length=32, required=False, allow_blank=True)
 
 
 class OrderItemSerializer(serializers.ModelSerializer):
@@ -116,6 +117,8 @@ class OrderSerializer(serializers.ModelSerializer):
     total = serializers.FloatField()
     subtotal = serializers.FloatField()
     shippingFee = serializers.FloatField(source="shipping_fee")
+    discountAmount = serializers.FloatField(source="discount_amount")
+    couponCode = serializers.CharField(source="coupon_code")
     date = serializers.DateTimeField(source="created_at")
 
     class Meta:
@@ -127,6 +130,8 @@ class OrderSerializer(serializers.ModelSerializer):
             "paymentStatus",
             "subtotal",
             "shippingFee",
+            "discountAmount",
+            "couponCode",
             "total",
             "shippingAddress",
             "discreetPackage",

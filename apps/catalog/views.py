@@ -20,7 +20,11 @@ class ProductViewSet(viewsets.ReadOnlyModelViewSet):
     lookup_field = "slug"
     lookup_value_regex = "[^/]+"
     def get_queryset(self):
-        queryset = Product.objects.filter(is_active=True).select_related("category")
+        queryset = (
+            Product.objects.filter(is_active=True)
+            .select_related("category")
+            .prefetch_related("uploaded_images")
+        )
         params = self.request.query_params
 
         category = params.get("category", params.get("cat"))
@@ -60,6 +64,11 @@ class ProductViewSet(viewsets.ReadOnlyModelViewSet):
                 "price-desc": lambda product: (-product.price, product.sort_order),
                 "rating": lambda product: (-product.rating, product.sort_order),
                 "newest": lambda product: (-product.created_at.timestamp(), product.sort_order),
+                "featured": lambda product: (
+                    not product.is_featured,
+                    product.sort_order,
+                    product.id,
+                ),
                 "popular": lambda product: (
                     not product.is_best_seller,
                     -product.rating,
@@ -83,4 +92,4 @@ class ProductViewSet(viewsets.ReadOnlyModelViewSet):
             return queryset.order_by("-created_at", "sort_order")
         if ordering == "popular":
             return queryset.order_by("-is_best_seller", "-rating", "sort_order")
-        return queryset.order_by("sort_order", "id")
+        return queryset.order_by("-is_featured", "sort_order", "id")
