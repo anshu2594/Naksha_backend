@@ -17,6 +17,7 @@ class ProductSerializer(serializers.ModelSerializer):
     reviewCount = serializers.IntegerField(source="review_count")
     isBestSeller = serializers.BooleanField(source="is_best_seller")
     isNew = serializers.BooleanField(source="is_new")
+    isFeatured = serializers.BooleanField(source="is_featured")
     availableSizes = serializers.ListField(source="available_sizes", child=serializers.CharField())
     availableCups = serializers.ListField(
         source="available_cups", child=serializers.CharField(), allow_empty=True
@@ -26,6 +27,16 @@ class ProductSerializer(serializers.ModelSerializer):
     )
     backDesign = serializers.CharField(source="back_design", allow_blank=True)
     sleeveLength = serializers.CharField(source="sleeve_length", allow_blank=True)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get("request")
+        uploaded = [
+            request.build_absolute_uri(image.image.url) if request else image.image.url
+            for image in instance.uploaded_images.all()
+        ]
+        data["images"] = list(data.get("images") or []) + uploaded
+        return data
 
     class Meta:
         model = Product
@@ -41,6 +52,7 @@ class ProductSerializer(serializers.ModelSerializer):
             "reviewCount",
             "isBestSeller",
             "isNew",
+            "isFeatured",
             "padding",
             "wire",
             "fabric",

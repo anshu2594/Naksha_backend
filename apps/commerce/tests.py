@@ -210,3 +210,83 @@ class CommerceApiTests(APITestCase):
             f"/api/v1/orders/{created.data['orderId']}/cancel"
         )
         self.assertEqual(response.status_code, 409)
+
+    def test_tracked_inventory_is_reserved_rejects_oversell_and_released_on_cancel(self):
+        product = Product.objects.get(pk="bra-01")
+        product.stock_quantity = 1
+        product.save(update_fields=["stock_quantity", "updated_at"])
+        self.add_bra_to_cart()
+        created = self.client.post(
+            "/api/v1/orders",
+            {
+                "shippingAddress": {
+                    "fullName": "Priya Sharma",
+                    "phone": "9876543210",
+                    "address": "House",
+                    "city": "Mumbai",
+                    "state": "Maharashtra",
+                    "pincode": "400001",
+                },
+                "paymentMethod": "cod",
+            },
+            format="json",
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        product.refresh_from_db()
+        self.assertEqual(product.stock_quantity, 0)
+
+        another_guest = GuestSession.objects.create()
+        self.client.credentials(HTTP_X_GUEST_ID=str(another_guest.pk))
+        self.add_bra_to_cart()
+        rejected = self.client.post(
+            "/api/v1/orders",
+            {
+                "shippingAddress": {
+                    "fullName": "Another Customer",
+                    "phone": "9876543211",
+                    "address": "House",
+                    "city": "Mumbai",
+                    "state": "Maharashtra",
+                    "pincode": "400001",
+                },
+                "paymentMethod": "cod",
+            },
+            format="json",
+        )
+        self.assertEqual(rejected.status_code, 409)
+        self.assertEqual(CartItem.objects.filter(guest=another_guest).count(), 1)
+
+        self.client.credentials(HTTP_X_GUEST_ID=str(self.guest.pk))
+        cancelled = self.client.post(
+            f"/api/v1/orders/{created.data['orderId']}/cancel"
+        )
+        self.assertEqual(cancelled.status_code, 200)
+        product.refresh_from_db()
+        self.assertEqual(product.stock_quantity, 1)
+
+    def test_root_and_health_routes_return_json(self):
+        self.client.credentials()
+        root = self.client.get("/")
+        self.assertEqual(root.status_code, 200)
+        self.assertEqual(root.json(), {"service": "Naksha API", "status": "ok"})
+        health = self.client.get("/health/")
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(health.json(), {"status": "ok"})
+
+    def test_frontend_preflight_allows_guest_and_idempotency_headers(self):
+        response = self.client.options(
+            "/api/v1/orders/",
+            HTTP_ORIGIN="http://localhost:5173",
+            HTTP_ACCESS_CONTROL_REQUEST_METHOD="POST",
+            HTTP_ACCESS_CONTROL_REQUEST_HEADERS=(
+                "authorization,content-type,idempotency-key,x-guest-id"
+            ),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response["Access-Control-Allow-Origin"], "http://localhost:5173"
+        )
+        allowed_headers = response["Access-Control-Allow-Headers"].lower()
+        self.assertIn("x-guest-id", allowed_headers)
+        self.assertIn("idempotency-key", allowed_headers)
+        self.assertIn("authorization", allowed_headers)
