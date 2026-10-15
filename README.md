@@ -7,10 +7,10 @@ Guest sessions continue to own storefront carts, wishlists, and orders through a
 ## Requirements
 
 - Python 3.10+
-- PostgreSQL 14+ for local/production use
+- PostgreSQL 18 for local/production use
 - PowerShell on Windows
 
-SQLite is used only as a convenient fallback when no `DB_NAME` is configured, including automated tests. To use PostgreSQL, create the database and configure the environment first.
+PostgreSQL is required for local, test, and production runs. Django will fail fast when database configuration is missing; SQLite is not used as a fallback.
 
 ## Windows setup (PowerShell)
 
@@ -24,21 +24,19 @@ python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-Edit `.env` with a unique `SECRET_KEY`, PostgreSQL credentials, allowed frontend origins, and Razorpay **test-mode** credentials if sandbox payments are needed. `.env` is ignored by Git. Never put provider secrets in frontend code or commit them.
+Edit `.env` with a unique `SECRET_KEY`, the password for the existing local PostgreSQL `naksha_admin` role, allowed frontend origins, and Razorpay **test-mode** credentials if sandbox payments are needed. This project targets the existing `naksha` database at `127.0.0.1:5432`; setup does not create a replacement database or role. `.env` is ignored by Git. Never put provider secrets in frontend code or commit them.
 
-Create a local PostgreSQL role and database from `psql` as a PostgreSQL administrator:
+Verify the configured PostgreSQL target and role before applying migrations:
 
-```sql
-CREATE USER naksha_user WITH PASSWORD 'choose-a-local-password';
-CREATE DATABASE naksha OWNER naksha_user;
+```powershell
+psql -h 127.0.0.1 -p 5432 -U naksha_admin -d naksha -c "SELECT current_database(), current_user, version();"
 ```
-
-Set the `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`, and `DB_PORT` values in `.env` to match. Do not use the example password in a deployed environment.
 
 Create database tables, load the existing storefront catalog, and start Django:
 
 ```powershell
 python manage.py migrate
+python manage.py showmigrations
 python manage.py seed_catalog
 python manage.py createsuperuser
 python manage.py runserver 127.0.0.1:8000
@@ -52,7 +50,7 @@ Set `FRONTEND_ORIGINS` to a comma-separated list of exact trusted browser origin
 
 The generated OpenAPI document is available at `GET /api/schema/`; interactive Swagger UI is at `GET /api/docs/`. These public documentation routes expose API schemas only, not store data.
 
-For deployment, set `DEBUG=False`, a private `SECRET_KEY`, explicit `ALLOWED_HOSTS`, PostgreSQL `DB_*` values, and HTTPS `FRONTEND_ORIGINS`/`CSRF_TRUSTED_ORIGINS`. Secrets must come from the deployment environment/secret manager and must not be committed. Enable `SECURE_SSL_REDIRECT`, configure `SECURE_HSTS_SECONDS` after HTTPS is available, and retain secure cookies (enabled automatically when `DEBUG=False`). If TLS terminates at a trusted reverse proxy, configure `SECURE_PROXY_SSL_HEADER` only for the exact header/value that proxy overwrites. Run `python manage.py check --deploy`; project checks reject production SQLite, wildcard/missing hosts, insecure cookies, and non-test Razorpay keys.
+For deployment, set `DEBUG=False`, a private `SECRET_KEY`, explicit `ALLOWED_HOSTS`, PostgreSQL `DB_*` values, and HTTPS `FRONTEND_ORIGINS`/`CSRF_TRUSTED_ORIGINS`. Secrets must come from the deployment environment/secret manager and must not be committed. Enable `SECURE_SSL_REDIRECT`, configure `SECURE_HSTS_SECONDS` after HTTPS is available, and retain secure cookies (enabled automatically when `DEBUG=False`). If TLS terminates at a trusted reverse proxy, configure `SECURE_PROXY_SSL_HEADER` only for the exact header/value that proxy overwrites. Run `python manage.py check --deploy`; project checks reject non-PostgreSQL database engines, wildcard/missing hosts, insecure cookies, and non-test Razorpay keys.
 
 Set `MEDIA_ROOT` to a persistent upload volume and serve uploaded product images from a durable web server or CDN in production. Local `/media/` serving is intentionally enabled only in `DEBUG`; the application does not claim that ephemeral local disk is production media storage. Razorpay test keys only are supported; payment operations fail closed when they are absent.
 
@@ -201,6 +199,16 @@ python manage.py test apps.catalog apps.commerce apps.backoffice
 python manage.py check
 python manage.py spectacular --validate --file schema.yml
 python manage.py check --deploy
+```
+
+With PostgreSQL configured, Django creates an isolated PostgreSQL test database (normally `test_naksha`). The configured development database itself is not used for test data.
+
+To verify applied migrations and expected application tables directly:
+
+```powershell
+python manage.py showmigrations
+psql -h 127.0.0.1 -p 5432 -U naksha_admin -d naksha -c "SELECT app, name, applied FROM django_migrations ORDER BY app, applied;"
+psql -h 127.0.0.1 -p 5432 -U naksha_admin -d naksha -c "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename;"
 ```
 
 ## Postman

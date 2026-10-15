@@ -18,7 +18,7 @@ def check_production_configuration(app_configs, **kwargs):
     if settings.DATABASES["default"]["ENGINE"] != "django.db.backends.postgresql":
         errors.append(
             Error(
-                "Production must use PostgreSQL; SQLite is for development and tests.",
+                "PostgreSQL is required; SQLite is not supported.",
                 id="backoffice.E002",
             )
         )

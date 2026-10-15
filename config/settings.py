@@ -15,10 +15,10 @@ def env_bool(name, default=False):
     return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
 
 
-SECRET_KEY = os.getenv("SECRET_KEY", "local-development-only-change-before-deployment")
+SECRET_KEY = os.getenv("SECRET_KEY", "")
+if not SECRET_KEY:
+    raise ImproperlyConfigured("Set SECRET_KEY in the environment before starting Django.")
 DEBUG = env_bool("DEBUG", True)
-if not DEBUG and SECRET_KEY == "local-development-only-change-before-deployment":
-    raise ImproperlyConfigured("Set a private SECRET_KEY when DEBUG is disabled.")
 ALLOWED_HOSTS = [
     host.strip()
     for host in os.getenv(
@@ -72,25 +72,27 @@ TEMPLATES = [
 WSGI_APPLICATION = "config.wsgi.application"
 ASGI_APPLICATION = "config.asgi.application"
 
-if os.getenv("DB_NAME"):
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.postgresql",
-            "NAME": os.environ["DB_NAME"],
-            "USER": os.getenv("DB_USER", ""),
-            "PASSWORD": os.getenv("DB_PASSWORD", ""),
-            "HOST": os.getenv("DB_HOST", "127.0.0.1"),
-            "PORT": os.getenv("DB_PORT", "5432"),
-            "CONN_MAX_AGE": 60,
-        }
+required_database_settings = ("DB_NAME", "DB_USER", "DB_PASSWORD")
+missing_database_settings = [
+    name for name in required_database_settings if not os.getenv(name)
+]
+if missing_database_settings:
+    raise ImproperlyConfigured(
+        "Set PostgreSQL settings in the environment: "
+        + ", ".join(missing_database_settings)
+    )
+
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": os.environ["DB_NAME"],
+        "USER": os.environ["DB_USER"],
+        "PASSWORD": os.environ["DB_PASSWORD"],
+        "HOST": os.getenv("DB_HOST", "127.0.0.1"),
+        "PORT": os.getenv("DB_PORT", "5432"),
+        "CONN_MAX_AGE": 60,
     }
-else:
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.sqlite3",
-            "NAME": BASE_DIR / "db.sqlite3",
-        }
-    }
+}
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
